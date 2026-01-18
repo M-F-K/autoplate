@@ -3,27 +3,44 @@ package main
 import (
 	"archive/zip"
 	"encoding/xml"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
-	"github.com/hashicorp/go-memdb"
 	"github.com/jlaffaye/ftp"
 )
 
-// LicensePlate represents a license plate record
-type LicensePlate struct {
-	Plate     string
-	Timestamp time.Time
+// XML structure matching the Danish vehicle registration format
+type ESStatistikListeModtag struct {
+	XMLName          xml.Name         `xml:"ESStatistikListeModtag_I"`
+	StatistikSamling StatistikSamling `xml:"StatistikSamling"`
 }
 
-// Vehicle represents the XML structure (adjust based on actual XML format)
-type Vehicle struct {
-	XMLName      xml.Name `xml:"Vehicle"`
-	LicensePlate string   `xml:"LicensePlate"`
+type StatistikSamling struct {
+	Statistik []Statistik `xml:"Statistik"`
+}
+
+type Statistik struct {
+	RegistreringNummerNummer        string                          `xml:"RegistreringNummerNummer"`
+	KoeretoejOplysningGrundStruktur KoeretoejOplysningGrundStruktur `xml:"KoeretoejOplysningGrundStruktur"`
+}
+
+type KoeretoejOplysningGrundStruktur struct {
+	KoeretoejBetegnelseStruktur KoeretoejBetegnelseStruktur `xml:"KoeretoejBetegnelseStruktur"`
+}
+
+type KoeretoejBetegnelseStruktur struct {
+	KoeretoejMaerkeTypeNavn string `xml:"KoeretoejMaerkeTypeNavn"`
+	Model                   Model  `xml:"Model"`
+}
+
+type Model struct {
+	KoeretoejModelTypeNavn string `xml:"KoeretoejModelTypeNavn"`
 }
 
 // ProgressReader wraps an io.Reader and reports progress
@@ -38,7 +55,6 @@ func (pr *ProgressReader) Read(p []byte) (int, error) {
 	n, err := pr.reader.Read(p)
 	pr.current += int64(n)
 
-	// Print progress every 1% or 1MB
 	if pr.total > 0 {
 		percentDone := (pr.current * 100) / pr.total
 		if percentDone > pr.lastPrint {
@@ -51,34 +67,159 @@ func (pr *ProgressReader) Read(p []byte) (int, error) {
 }
 
 func main() {
-	// Connect to FTP server
+	fileInput := flag.String("file", "", "Path to local XML or ZIP file (if not provided, downloads from FTP)")
+	flag.Parse()
+
+	// Use simple map instead of memdb
+	plates := make(map[string]string, 100000) // Pre-allocate with estimated capacity
+
+	if *fileInput != "" {
+		log.Printf("Using local file: %s\n", *fileInput)
+		if err := processLocalFile(*fileInput, plates); err != nil {
+			log.Fatalf("Error processing local file: %v", err)
+		}
+	} else {
+		log.Println("No file specified, downloading from FTP server...")
+		if err := downloadAndProcess(plates); err != nil {
+			log.Fatalf("Error downloading and processing: %v", err)
+		}
+	}
+
+	displayResults(plates)
+}
+
+func processLocalFile(filePath string, plates map[string]string) error {
+	ext := strings.ToLower(filePath[len(filePath)-4:])
+
+	switch ext {
+	case ".xml":
+		file, err := os.Open(filePath)
+		if err != nil {
+			return fmt.Errorf("failed to open XML file: %w", err)
+		}
+		defer file.Close()
+
+		count, err := streamXML(file, plates)
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("\n✓ Successfully processed %d license plates\n", count)
+		return nil
+
+	case ".zip":
+		return processZipFile(filePath, plates)
+
+	default:
+		return fmt.Errorf("unsupported file type: %s (must be .xml or .zip)", ext)
+	}
+}
+
+func processZipFile(zipPath string, plates map[string]string) error {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return fmt.Errorf("failed to open zip file: %w", err)
+	}
+	defer r.Close()
+
+	processedCount := 0
+
+	for _, zipFile := range r.File {
+		if zipFile.FileInfo().IsDir() || !strings.HasSuffix(strings.ToLower(zipFile.Name), ".xml") {
+			continue
+		}
+
+		fmt.Printf("Processing: %s (%.2f MB)\n", zipFile.Name, float64(zipFile.UncompressedSize64)/(1024*1024))
+
+		rc, err := zipFile.Open()
+		if err != nil {
+			log.Printf("Warning: failed to open %s: %v", zipFile.Name, err)
+			continue
+		}
+
+		count, err := streamXML(rc, plates)
+		rc.Close()
+
+		if err != nil {
+			log.Printf("Warning: failed to process %s: %v", zipFile.Name, err)
+			continue
+		}
+
+		processedCount += count
+	}
+
+	fmt.Printf("\n✓ Successfully processed %d license plates\n", processedCount)
+	return nil
+}
+
+func streamXML(reader io.Reader, plates map[string]string) (int, error) {
+	decoder := xml.NewDecoder(reader)
+	processedCount := 0
+
+	// Reuse buffer for string concatenation
+	var sb strings.Builder
+	sb.Grow(64) // Pre-allocate reasonable size for make+model
+
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return processedCount, fmt.Errorf("XML parse error: %w", err)
+		}
+
+		if se, ok := token.(xml.StartElement); ok && se.Name.Local == "Statistik" {
+			var stat Statistik
+
+			if err := decoder.DecodeElement(&stat, &se); err != nil {
+				log.Printf("Warning: failed to decode Statistik: %v", err)
+				continue
+			}
+
+			if stat.RegistreringNummerNummer != "" {
+				// Build concatenated make and model
+				sb.Reset()
+				sb.WriteString(stat.KoeretoejOplysningGrundStruktur.KoeretoejBetegnelseStruktur.KoeretoejMaerkeTypeNavn)
+				sb.WriteString(" ")
+				sb.WriteString(stat.KoeretoejOplysningGrundStruktur.KoeretoejBetegnelseStruktur.Model.KoeretoejModelTypeNavn)
+
+				plates[stat.RegistreringNummerNummer] = sb.String()
+				processedCount++
+
+				if processedCount%10000 == 0 {
+					fmt.Printf("  Processed %d plates...\n", processedCount)
+				}
+			}
+		}
+	}
+
+	return processedCount, nil
+}
+
+func downloadAndProcess(plates map[string]string) error {
 	conn, err := ftp.Dial("5.44.137.84:21", ftp.DialWithTimeout(10*time.Second))
 	if err != nil {
-		log.Fatalf("Failed to connect to FTP: %v", err)
+		return fmt.Errorf("failed to connect to FTP: %w", err)
 	}
 	defer conn.Quit()
 
-	// Login (adjust credentials as needed)
-	err = conn.Login("anonymous", "anonymous")
-	if err != nil {
-		log.Fatalf("Failed to login: %v", err)
+	if err = conn.Login("anonymous", "anonymous"); err != nil {
+		return fmt.Errorf("failed to login: %w", err)
 	}
 
-	// Change to target directory
-	err = conn.ChangeDir("/ESStatistikListeModtag")
-	if err != nil {
-		log.Fatalf("Failed to change directory: %v", err)
+	if err = conn.ChangeDir("/ESStatistikListeModtag"); err != nil {
+		return fmt.Errorf("failed to change directory: %w", err)
 	}
 
-	// Find newest zip file
 	entries, err := conn.List(".")
 	if err != nil {
-		log.Fatalf("Failed to list directory: %v", err)
+		return fmt.Errorf("failed to list directory: %w", err)
 	}
 
 	var newestZip *ftp.Entry
 	for _, entry := range entries {
-		if entry.Type == ftp.EntryTypeFile && len(entry.Name) > 4 && entry.Name[len(entry.Name)-4:] == ".zip" {
+		if entry.Type == ftp.EntryTypeFile && strings.HasSuffix(entry.Name, ".zip") {
 			if newestZip == nil || entry.Time.After(newestZip.Time) {
 				newestZip = entry
 			}
@@ -86,180 +227,68 @@ func main() {
 	}
 
 	if newestZip == nil {
-		log.Fatal("No zip files found in directory")
+		return fmt.Errorf("no zip files found in directory")
 	}
 
 	fmt.Printf("Downloading: %s (%s)\n", newestZip.Name, newestZip.Time.Format(time.RFC3339))
 	fmt.Printf("File size: %.2f MB\n", float64(newestZip.Size)/(1024*1024))
 
-	// Download zip file to temporary file for streaming
 	resp, err := conn.Retr(newestZip.Name)
 	if err != nil {
-		log.Fatalf("Failed to retrieve file: %v", err)
+		return fmt.Errorf("failed to retrieve file: %w", err)
 	}
 	defer resp.Close()
 
-	// Create temporary file for streaming
 	tempFile, err := os.CreateTemp("", "ftp-zip-*.zip")
 	if err != nil {
-		log.Fatalf("Failed to create temp file: %v", err)
+		return fmt.Errorf("failed to create temp file: %w", err)
 	}
 	defer os.Remove(tempFile.Name())
 	defer tempFile.Close()
 
-	// Initialize memdb
-	db, err := setupMemDB()
-	if err != nil {
-		log.Fatalf("Failed to setup memdb: %v", err)
-	}
-
-	// Create progress reader
 	progressReader := &ProgressReader{
 		reader: resp,
 		total:  int64(newestZip.Size),
 	}
 
-	// Stream download to temp file with progress
 	written, err := io.Copy(tempFile, progressReader)
 	if err != nil {
-		log.Fatalf("Failed to stream file: %v", err)
+		return fmt.Errorf("failed to stream file: %w", err)
 	}
 
 	fmt.Printf("\n✓ Downloaded %d bytes\n", written)
+	tempFile.Close()
 
-	// Reset file pointer to beginning
-	_, err = tempFile.Seek(0, 0)
-	if err != nil {
-		log.Fatalf("Failed to seek temp file: %v", err)
-	}
-
-	// Process zip file by streaming each entry
-	err = processZipStream(tempFile, written, db)
-	if err != nil {
-		log.Fatalf("Failed to process zip: %v", err)
-	}
-
-	// Display results
-	displayResults(db)
+	return processZipFile(tempFile.Name(), plates)
 }
 
-func setupMemDB() (*memdb.MemDB, error) {
-	schema := &memdb.DBSchema{
-		Tables: map[string]*memdb.TableSchema{
-			"plates": {
-				Name: "plates",
-				Indexes: map[string]*memdb.IndexSchema{
-					"id": {
-						Name:    "id",
-						Unique:  true,
-						Indexer: &memdb.StringFieldIndex{Field: "Plate"},
-					},
-				},
-			},
-		},
+func displayResults(plates map[string]string) {
+	// Convert map to sorted slice for display
+	type plateEntry struct {
+		plate         string
+		makeModelName string
 	}
 
-	return memdb.NewMemDB(schema)
-}
-
-func processZipStream(file *os.File, size int64, db *memdb.MemDB) error {
-	reader, err := zip.NewReader(file, size)
-	if err != nil {
-		return fmt.Errorf("failed to create zip reader: %w", err)
+	entries := make([]plateEntry, 0, len(plates))
+	for plate, makeModel := range plates {
+		entries = append(entries, plateEntry{plate, makeModel})
 	}
 
-	txn := db.Txn(true)
-	defer txn.Abort()
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].plate < entries[j].plate
+	})
 
-	processedCount := 0
-
-	for _, zipFile := range reader.File {
-		if zipFile.FileInfo().IsDir() {
-			continue
-		}
-
-		fmt.Printf("Processing: %s (%.2f KB)\n", zipFile.Name, float64(zipFile.UncompressedSize64)/1024)
-
-		// Open file in zip for streaming
-		rc, err := zipFile.Open()
-		if err != nil {
-			log.Printf("Warning: failed to open %s: %v", zipFile.Name, err)
-			continue
-		}
-
-		// Stream parse XML without loading entire file
-		decoder := xml.NewDecoder(rc)
-		
-		for {
-			token, err := decoder.Token()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				log.Printf("Warning: XML parse error in %s: %v", zipFile.Name, err)
-				break
-			}
-
-			// Look for Vehicle start elements
-			if se, ok := token.(xml.StartElement); ok {
-				if se.Name.Local == "Vehicle" {
-					var vehicle Vehicle
-					if err := decoder.DecodeElement(&vehicle, &se); err != nil {
-						log.Printf("Warning: failed to decode vehicle: %v", err)
-						continue
-					}
-
-					if vehicle.LicensePlate != "" {
-						plate := &LicensePlate{
-							Plate:     vehicle.LicensePlate,
-							Timestamp: time.Now(),
-						}
-						if err := txn.Insert("plates", plate); err != nil {
-							log.Printf("Warning: failed to insert plate: %v", err)
-						}
-						processedCount++
-						
-						// Progress indicator
-						if processedCount%1000 == 0 {
-							fmt.Printf("  Processed %d plates...\n", processedCount)
-						}
-					}
-				}
-			}
-		}
-
-		rc.Close()
+	fmt.Printf("\n=== License Plates in Database (%d total) ===\n", len(entries))
+	displayLimit := 10
+	if len(entries) < displayLimit {
+		displayLimit = len(entries)
 	}
 
-	txn.Commit()
-	fmt.Printf("\n✓ Successfully processed %d license plates\n", processedCount)
-	return nil
-}
-
-func displayResults(db *memdb.MemDB) {
-	txn := db.Txn(false)
-	defer txn.Abort()
-
-	it, err := txn.Get("plates", "id")
-	if err != nil {
-		log.Printf("Failed to query plates: %v", err)
-		return
+	for i := 0; i < displayLimit; i++ {
+		fmt.Printf("%d. %s - %s\n", i+1, entries[i].plate, entries[i].makeModelName)
 	}
 
-	var plates []string
-	for obj := it.Next(); obj != nil; obj = it.Next() {
-		p := obj.(*LicensePlate)
-		plates = append(plates, p.Plate)
-	}
-
-	sort.Strings(plates)
-
-	fmt.Printf("\n=== License Plates in Database (%d total) ===\n", len(plates))
-	for i, plate := range plates {
-		fmt.Printf("%d. %s\n", i+1, plate)
-		if i >= 9 {
-			fmt.Printf("... and %d more\n", len(plates)-10)
-			break
-		}
+	if len(entries) > displayLimit {
+		fmt.Printf("... and %d more\n", len(entries)-displayLimit)
 	}
 }

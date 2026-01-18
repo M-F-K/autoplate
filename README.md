@@ -14,3 +14,7 @@ Note: the download from the ftpserver takes a long time, this could probably be 
 
 go build autoplate.go
 
+## run autoplate
+
+./autoplate
+
