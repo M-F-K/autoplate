@@ -20,5 +20,10 @@ go build autoplate.go
 
 If you allready have dowloaded the .zip file (or have the extracted .xml file) this can be used as input instead of the default downloading of the newest file.
 
-./autoplate optionalZipOrXmlfile
+./autoplate -file optionalZipOrXmlfile
+
+if you using the supplied test example.
+
+./autoplate -file ./test/ESStatistikListeModtag-20261102-165603.zip 
+
 
